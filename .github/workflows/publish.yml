@@ -1,0 +1,40 @@
+name: Publish binaries
+
+on:
+  push:
+    tags:
+      - "v**"
+  workflow_dispatch:
+    inputs: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v1
+      with:
+        fetch-depth: 50
+
+    - name: Setup Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: '^1.15.8'
+
+    - name: Build
+      run: |
+        make
+        for asset in ./bin/*; do
+          xz -9 "${asset}"
+        done
+
+    - name: Publish
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        assets=()
+        for asset in ./bin/*.xz; do
+          assets+=("-a" "${asset}")
+        done
+        tag_name="${GITHUB_REF##*/}"
+        hub release create "${assets[@]}" -m "$tag_name" "$tag_name"
