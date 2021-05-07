@@ -5,8 +5,8 @@ VMs pretend like they are.  The only requirement is that the VM runs cloud-init
 (or otherwise populates `/run/cloud-init/instance-data.json` with appropriate
 data).
 
-For better compatibility VM instance metadata should contain the following
-keys:
+For better compatibility VM instance metadata should contain at least
+the following keys:
 
 - `region`
 - `availability-zone`

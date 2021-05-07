@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 
 	"k8s.io/klog/v2"
@@ -15,8 +16,59 @@ func main() {
 	options := GetOptions(fs)
 
 	http.HandleFunc(
+		"/latest/meta-data/ami-id",
+		amiIdHandler,
+	)
+
+	http.HandleFunc(
 		"/latest/meta-data/instance-id",
 		instanceIdHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/instance-type",
+		instanceTypeHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/local-hostname",
+		localHostnameHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/public-hostname",
+		localHostnameHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/local-ipv4",
+		func(w http.ResponseWriter, r *http.Request) {
+			localIPv4Handler(w, r, options.NetIface)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/public-ipv4",
+		func(w http.ResponseWriter, r *http.Request) {
+			localIPv4Handler(w, r, options.NetIface)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/hostname",
+		localHostnameHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/mac",
+		func(w http.ResponseWriter, r *http.Request) {
+			macHandler(w, r, options.NetIface)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/placement/availability-zone",
+		placementAvailabilityZoneHandler,
 	)
 
 	http.HandleFunc(
@@ -52,6 +104,61 @@ func getInstanceData() (map[string]interface{}, error) {
 	return jsonMap, nil
 }
 
+func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+	idata, err := getInstanceData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else {
+		fields := idata["v1"].(map[string]interface{})
+		fmt.Fprintf(w, "%s-%s", fields["distro"], fields["distro_release"])
+	}
+}
+
+func localHostnameHandler(w http.ResponseWriter, r *http.Request) {
+	idata, err := getInstanceData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else {
+		fields := idata["ds"].(map[string]interface{})
+		fields = fields["meta_data"].(map[string]interface{})
+		fmt.Fprintf(w, "%s", fields["local-hostname"])
+	}
+}
+
+func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
+	iff, err := net.InterfaceByName(iface)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	addrs, err := iff.Addrs()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	var ipString string
+
+	for _, addr := range addrs {
+		switch v := addr.(type) {
+		case *net.IPAddr:
+		case *net.IPNet:
+			if v.IP.To4() != nil {
+				ipString = v.IP.String()
+				break
+			}
+		}
+	}
+
+	if ipString == "" {
+		http.Error(
+			w,
+			fmt.Sprintf("cannot determine address of %s", iface),
+			http.StatusInternalServerError)
+	}
+
+	fmt.Fprintf(w, "%s", ipString)
+}
+
 func instanceIdHandler(w http.ResponseWriter, r *http.Request) {
 	idata, err := getInstanceData()
 	if err != nil {
@@ -59,6 +166,28 @@ func instanceIdHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fields := idata["v1"].(map[string]interface{})
 		fmt.Fprintf(w, "%s", fields["instance-id"])
+	}
+}
+
+func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "%s", "t2.micro")
+}
+
+func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
+	iff, err := net.InterfaceByName(iface)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	fmt.Fprintf(w, "%s", iff.HardwareAddr.String())
+}
+
+func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
+	idata, err := getInstanceData()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else {
+		fields := idata["v1"].(map[string]interface{})
+		fmt.Fprintf(w, "%s", fields["availability-zone"])
 	}
 }
 

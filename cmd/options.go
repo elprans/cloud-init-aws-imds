@@ -19,15 +19,18 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
 
 // Options is the combined set of options for all operating modes.
 type Options struct {
-	BindTo string
-	Port   string
+	BindTo   string
+	Port     string
+	NetIface string
 }
 
 func GetOptions(fs *flag.FlagSet) *Options {
@@ -35,6 +38,7 @@ func GetOptions(fs *flag.FlagSet) *Options {
 		version = fs.Bool("version", false, "Print the version and exit.")
 		bindTo  = fs.String("bind-to", "169.254.169.254", "Address to bind to.")
 		port    = fs.String("port", "80", "Port to bind to.")
+		iface   = fs.String("net-iface", "", "Network interface used for traffic.")
 
 		args = os.Args[1:]
 	)
@@ -50,8 +54,24 @@ func GetOptions(fs *flag.FlagSet) *Options {
 		os.Exit(0)
 	}
 
+	if *iface == "" {
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			panic(err)
+		}
+
+		for _, i := range ifaces {
+			if !strings.HasPrefix(i.Name, "lo") &&
+				!strings.HasPrefix(i.Name, "docker") {
+				*iface = i.Name
+				break
+			}
+		}
+	}
+
 	return &Options{
-		BindTo: *bindTo,
-		Port:   *port,
+		BindTo:   *bindTo,
+		Port:     *port,
+		NetIface: *iface,
 	}
 }
