@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -104,24 +105,51 @@ func getInstanceData() (map[string]interface{}, error) {
 	return jsonMap, nil
 }
 
-func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+func getV1StandardMetadata() (map[string]interface{}, error) {
 	idata, err := getInstanceData()
+	if err != nil {
+		return nil, err
+	} else {
+		fields, found := idata["v1"]
+		if !found {
+			return nil, errors.New("v1 metadata is missing or malformed")
+		}
+		return fields.(map[string]interface{}), nil
+	}
+}
+
+func getDSMetadata() (map[string]interface{}, error) {
+	idata, err := getInstanceData()
+	if err != nil {
+		return nil, err
+	} else {
+		ds, found := idata["ds"]
+		if !found {
+			return nil, errors.New("ds metadata is missing or malformed")
+		}
+		fields, found := ds.(map[string]interface{})["meta_data"]
+		if !found {
+			return nil, errors.New("ds metadata is missing or malformed")
+		}
+		return fields.(map[string]interface{}), nil
+	}
+}
+
+func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fields := idata["v1"].(map[string]interface{})
 		fmt.Fprintf(w, "%s-%s", fields["distro"], fields["distro_release"])
 	}
 }
 
 func localHostnameHandler(w http.ResponseWriter, r *http.Request) {
-	idata, err := getInstanceData()
+	fields, err := getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fields := idata["ds"].(map[string]interface{})
-		fields = fields["meta_data"].(map[string]interface{})
-		fmt.Fprintf(w, "%s", fields["local-hostname"])
+		fmt.Fprintf(w, "%s", fields["local_hostname"])
 	}
 }
 
@@ -160,17 +188,25 @@ func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
 }
 
 func instanceIdHandler(w http.ResponseWriter, r *http.Request) {
-	idata, err := getInstanceData()
+	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fields := idata["v1"].(map[string]interface{})
-		fmt.Fprintf(w, "%s", fields["instance-id"])
+		fmt.Fprintf(w, "%s", fields["instance_id"])
 	}
 }
 
 func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "%s", "t2.micro")
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else {
+		instType := fields["instance_type"]
+		if instType == nil {
+			instType = "t2.micro"
+		}
+		fmt.Fprintf(w, "%s", instType)
+	}
 }
 
 func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
@@ -182,32 +218,38 @@ func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 }
 
 func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
-	idata, err := getInstanceData()
+	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fields := idata["v1"].(map[string]interface{})
-		fmt.Fprintf(w, "%s", fields["availability-zone"])
+		fmt.Fprintf(w, "%s", fields["availability_zone"])
 	}
 }
 
 func instanceIdentityHandler(w http.ResponseWriter, r *http.Request) {
-	idata, err := getInstanceData()
+	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	fields := idata["v1"].(map[string]interface{})
+	dsfields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 
 	result := make(map[string]interface{})
 	result["devpayProductCodes"] = make([]string, 0)
 	result["marketplaceProductCodes"] = make([]string, 0)
-	result["availabilityZone"] = fields["availability-zone"]
+	result["availabilityZone"] = fields["availability_zone"]
 	result["privateIp"] = nil
 	result["version"] = "2017-09-30"
-	result["instanceId"] = fields["instance-id"]
+	result["instanceId"] = fields["instance_id"]
 	result["billingProducts"] = nil
-	result["instanceType"] = "t2.micro"
+	if dsfields["instance_type"] != nil {
+		result["instanceType"] = dsfields["instance_type"]
+	} else {
+		result["instanceType"] = "t2.micro"
+	}
 	result["accountId"] = "invalid"
 	result["imageId"] = fmt.Sprintf(
 		"%s %s", fields["distro"], fields["distro_release"])
