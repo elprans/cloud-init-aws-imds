@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -74,7 +75,9 @@ func main() {
 
 	http.HandleFunc(
 		"/latest/dynamic/instance-identity/document",
-		instanceIdentityHandler,
+		func(w http.ResponseWriter, r *http.Request) {
+			instanceIdentityHandler(w, r, options)
+		},
 	)
 
 	klog.Fatalln(http.ListenAndServe(
@@ -93,6 +96,7 @@ func logRequest(handler http.Handler) http.Handler {
 func getInstanceData() (map[string]interface{}, error) {
 	data, err := ioutil.ReadFile("/run/cloud-init/instance-data.json")
 	if err != nil {
+		klog.Errorf("%s\n", err.Error())
 		return nil, err
 	}
 
@@ -112,6 +116,7 @@ func getV1StandardMetadata() (map[string]interface{}, error) {
 	} else {
 		fields, found := idata["v1"]
 		if !found {
+			klog.Errorf("v1 is missing or malformed\n")
 			return nil, errors.New("v1 metadata is missing or malformed")
 		}
 		return fields.(map[string]interface{}), nil
@@ -125,43 +130,143 @@ func getDSMetadata() (map[string]interface{}, error) {
 	} else {
 		ds, found := idata["ds"]
 		if !found {
+			klog.Errorf("ds metadata is missing or malformed\n")
 			return nil, errors.New("ds metadata is missing or malformed")
 		}
 		fields, found := ds.(map[string]interface{})["meta_data"]
 		if !found {
+			klog.Errorf("ds metadata is missing or malformed\n")
 			return nil, errors.New("ds metadata is missing or malformed")
 		}
 		return fields.(map[string]interface{}), nil
 	}
 }
 
-func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+func getScalarFieldValue(
+	fields map[string]interface{},
+	name string,
+	deflt string,
+) (string, error) {
+	val, found := fields[name]
+	if !found {
+		name = strings.ReplaceAll(name, "-", "_")
+		val, found = fields[name]
+		if !found {
+			name = strings.ReplaceAll(name, "_", "-")
+			val, found = fields[name]
+			if !found {
+				if deflt != "" {
+					return deflt, nil
+				} else {
+					klog.Errorf("'%s' metadata value is missing\n", name)
+					return "", errors.New(
+						fmt.Sprintf("%s is missing in metadata", name))
+				}
+			}
+		}
+	}
+
+	switch v := val.(type) {
+	case string:
+		return v, nil
+	default:
+		klog.Errorf("'%s' metadata value is not a string\n", name)
+		return "", errors.New(
+			fmt.Sprintf("%s value is not a string", name))
+	}
+}
+
+func getV1FieldValue(
+	name string,
+	deflt string,
+) (string, error) {
 	fields, err := getV1StandardMetadata()
+	if err != nil {
+		return "", err
+	}
+	return getScalarFieldValue(fields, name, deflt)
+}
+
+func getDSFieldValue(
+	name string,
+	deflt string,
+) (string, error) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		return "", err
+	}
+	return getScalarFieldValue(fields, name, deflt)
+}
+
+func formatFields(
+	format string,
+	fields map[string]interface{},
+	names ...string,
+) (string, error) {
+	vals := make([]interface{}, len(names))
+
+	for i, name := range names {
+		val, err := getScalarFieldValue(fields, name, "")
+		if err != nil {
+			return "", err
+		}
+		vals[i] = val
+	}
+
+	return fmt.Sprintf(format, vals...), nil
+}
+
+func formatV1Fields(
+	format string,
+	names ...string,
+) (string, error) {
+	fields, err := getV1StandardMetadata()
+	if err != nil {
+		return "", err
+	}
+
+	return formatFields(format, fields, names...)
+}
+
+func formatDSFields(
+	format string,
+	names ...string,
+) (string, error) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		return "", err
+	}
+
+	return formatFields(format, fields, names...)
+}
+
+func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+	val, err := formatV1Fields("%s-%s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fmt.Fprintf(w, "%s-%s", fields["distro"], fields["distro_release"])
+		fmt.Fprintf(w, "%s", val)
 	}
 }
 
 func localHostnameHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+	val, err := formatDSFields("%s", "local_hostname")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fmt.Fprintf(w, "%s", fields["local_hostname"])
+		fmt.Fprintf(w, "%s", val)
 	}
 }
 
-func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
+func getLocalIPv4Address(iface string) (string, error) {
 	iff, err := net.InterfaceByName(iface)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return "", err
 	}
 
 	addrs, err := iff.Addrs()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return "", err
 	}
 
 	var ipString string
@@ -178,33 +283,36 @@ func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
 	}
 
 	if ipString == "" {
-		http.Error(
-			w,
-			fmt.Sprintf("cannot determine address of %s", iface),
-			http.StatusInternalServerError)
+		msg := fmt.Sprintf("cannot determine address of %s", iface)
+		klog.Errorf("%s\n", msg)
+		return "", errors.New(msg)
 	}
 
+	return ipString, nil
+}
+
+func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
+	ipString, err := getLocalIPv4Address(iface)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 	fmt.Fprintf(w, "%s", ipString)
 }
 
 func instanceIdHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getV1StandardMetadata()
+	val, err := formatV1Fields("%s", "instance_id")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fmt.Fprintf(w, "%s", fields["instance_id"])
+		fmt.Fprintf(w, "%s", val)
 	}
 }
 
 func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+	instType, err := getDSFieldValue("instance_type", "t2.micro")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		instType := fields["instance_type"]
-		if instType == nil {
-			instType = "t2.micro"
-		}
 		fmt.Fprintf(w, "%s", instType)
 	}
 }
@@ -218,15 +326,19 @@ func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 }
 
 func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getV1StandardMetadata()
+	az, err := getV1FieldValue("availability_zone", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	} else {
-		fmt.Fprintf(w, "%s", fields["availability_zone"])
+		fmt.Fprintf(w, "%s", az)
 	}
 }
 
-func instanceIdentityHandler(w http.ResponseWriter, r *http.Request) {
+func instanceIdentityHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+	options *Options,
+) {
 	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -237,27 +349,57 @@ func instanceIdentityHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
+	az, err := getScalarFieldValue(fields, "availability_zone", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	instId, err := getScalarFieldValue(fields, "instance_id", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	instType, err := getScalarFieldValue(dsfields, "instance_type", "t2.micro")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	imageId, err := formatV1Fields("%s %s", "distro", "distro_release")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	machine, err := getScalarFieldValue(fields, "machine", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	region, err := getScalarFieldValue(fields, "region", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	ipString, err := getLocalIPv4Address(options.NetIface)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
 	result := make(map[string]interface{})
 	result["devpayProductCodes"] = make([]string, 0)
 	result["marketplaceProductCodes"] = make([]string, 0)
-	result["availabilityZone"] = fields["availability_zone"]
-	result["privateIp"] = nil
+	result["availabilityZone"] = az
+	result["privateIp"] = ipString
 	result["version"] = "2017-09-30"
-	result["instanceId"] = fields["instance_id"]
+	result["instanceId"] = instId
+	result["instanceType"] = instType
 	result["billingProducts"] = nil
-	if dsfields["instance_type"] != nil {
-		result["instanceType"] = dsfields["instance_type"]
-	} else {
-		result["instanceType"] = "t2.micro"
-	}
 	result["accountId"] = "invalid"
-	result["imageId"] = fmt.Sprintf(
-		"%s %s", fields["distro"], fields["distro_release"])
+	result["imageId"] = imageId
 	result["pendingTime"] = nil
-	result["architecture"] = fields["machine"]
+	result["architecture"] = machine
 	result["kernelId"] = nil
 	result["ramdiskId"] = nil
-	result["region"] = fields["region"]
+	result["region"] = region
 
 	jsonData, err := json.Marshal(result)
 	if err != nil {
