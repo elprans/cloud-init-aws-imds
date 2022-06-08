@@ -74,6 +74,16 @@ func main() {
 	)
 
 	http.HandleFunc(
+		"/latest/meta-data/services/domain",
+		servicesDomainHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/services/endpoints",
+		servicesEndpointsHandler,
+	)
+
+	http.HandleFunc(
 		"/latest/dynamic/instance-identity/document",
 		func(w http.ResponseWriter, r *http.Request) {
 			instanceIdentityHandler(w, r, options)
@@ -173,6 +183,40 @@ func getScalarFieldValue(
 		klog.Errorf("'%s' metadata value is not a string\n", name)
 		return "", errors.New(
 			fmt.Sprintf("%s value is not a string", name))
+	}
+}
+
+func getMapFieldValue(
+	fields map[string]interface{},
+	name string,
+	deflt map[string]interface{},
+) (map[string]interface{}, error) {
+	val, found := fields[name]
+	if !found {
+		name = strings.ReplaceAll(name, "-", "_")
+		val, found = fields[name]
+		if !found {
+			name = strings.ReplaceAll(name, "_", "-")
+			val, found = fields[name]
+			if !found {
+				if deflt != nil {
+					return deflt, nil
+				} else {
+					klog.Errorf("'%s' metadata value is missing\n", name)
+					return nil, errors.New(
+						fmt.Sprintf("%s is missing in metadata", name))
+				}
+			}
+		}
+	}
+
+	switch v := val.(type) {
+	case map[string]interface{}:
+		return v, nil
+	default:
+		klog.Errorf("'%s' metadata value is not a map\n", name)
+		return nil, errors.New(
+			fmt.Sprintf("%s value is not a map", name))
 	}
 }
 
@@ -332,6 +376,72 @@ func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Fprintf(w, "%s", az)
 	}
+}
+
+func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	services, err := getMapFieldValue(fields, "services", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if services == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	dom, err := getScalarFieldValue(services, "domain", "")
+	if dom == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else {
+		fmt.Fprintf(w, "%s", dom)
+	}
+}
+
+func servicesEndpointsHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	services, err := getMapFieldValue(fields, "services", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if services == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	endpoints, err := getMapFieldValue(services, "endpoints", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if endpoints == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	data, err := json.Marshal(endpoints)
+	if err != nil {
+		http.Error(
+			w,
+			fmt.Errorf("cannot marshal json: %w", err).Error(),
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	w.Write(data)
 }
 
 func instanceIdentityHandler(
