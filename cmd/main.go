@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"path"
+	"path/filepath"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -65,6 +67,27 @@ func main() {
 		"/latest/meta-data/mac",
 		func(w http.ResponseWriter, r *http.Request) {
 			macHandler(w, r, options.NetIface)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/network/interfaces/macs",
+		func(w http.ResponseWriter, r *http.Request) {
+			macsHandler(w, r)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/block-device-mapping",
+		func(w http.ResponseWriter, r *http.Request) {
+			blockDeviceMappingListHandler(w, r)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/block-device-mapping/",
+		func(w http.ResponseWriter, r *http.Request) {
+			blockDeviceMappingHandler(w, r)
 		},
 	)
 
@@ -369,6 +392,49 @@ func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 	fmt.Fprintf(w, "%s", iff.HardwareAddr.String())
 }
 
+func macsHandler(w http.ResponseWriter, r *http.Request) {
+	iff, err := net.Interfaces()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	for i, iface := range iff {
+		if i > 0 {
+			fmt.Fprintf(w, "\n")
+		}
+		fmt.Fprintf(w, "%s/", iface.HardwareAddr.String())
+	}
+}
+
+func blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
+	devices, err := getBlockDevices()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	i := 0
+	for dev := range devices {
+		if i > 0 {
+			fmt.Fprintf(w, "\n")
+		}
+		fmt.Fprintf(w, "%s", dev)
+		i += 1
+	}
+}
+
+func blockDeviceMappingHandler(w http.ResponseWriter, r *http.Request) {
+	devices, err := getBlockDevices()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	device := path.Base(r.URL.Path)
+	path, ok := devices[device]
+	if !ok {
+		http.Error(w, "No such device", http.StatusNotFound)
+	}
+	fmt.Fprintf(w, "%s", path)
+}
+
 func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
 	az, err := getV1FieldValue("availability_zone", "")
 	if err != nil {
@@ -517,4 +583,31 @@ func instanceIdentityHandler(
 	}
 
 	w.Write(jsonData)
+}
+
+func getBlockDevices() (map[string]string, error) {
+	disks := "/dev/disk/by-label"
+	dir, err := ioutil.ReadDir(disks)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string)
+
+	for _, f := range dir {
+		name := f.Name()
+		if strings.Compare(name, "UEFI") == 0 ||
+			strings.Compare(name, "cidata") == 0 {
+			continue
+		}
+
+		node, err := filepath.EvalSymlinks(path.Join(disks, name))
+		if err != nil {
+			continue
+		}
+
+		result[name] = node
+	}
+
+	return result, nil
 }
