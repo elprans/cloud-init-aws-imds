@@ -92,6 +92,27 @@ func main() {
 	)
 
 	http.HandleFunc(
+		"/latest/meta-data/iam/info",
+		func(w http.ResponseWriter, r *http.Request) {
+			iamInfoHandler(w, r)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/iam/security-credentials",
+		func(w http.ResponseWriter, r *http.Request) {
+			iamSecurityCredentialsListHandler(w, r)
+		},
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/iam/security-credentials/",
+		func(w http.ResponseWriter, r *http.Request) {
+			iamSecurityCredentialsHandler(w, r)
+		},
+	)
+
+	http.HandleFunc(
 		"/latest/meta-data/placement/availability-zone",
 		placementAvailabilityZoneHandler,
 	)
@@ -384,6 +405,118 @@ func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	iam, err := getMapFieldValue(fields, "iam", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(iam) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	profile, err := getMapFieldValue(
+		iam, "instance-profile", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(profile) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else {
+		data, err := json.MarshalIndent(profile, "", "  ")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		} else {
+			fmt.Fprintf(w, "%s", data)
+		}
+	}
+}
+
+func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	iam, err := getMapFieldValue(fields, "iam", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(iam) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	roleName, err := getScalarFieldValue(iam, "role-name", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if roleName == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else {
+		fmt.Fprintf(w, "%s", roleName)
+	}
+}
+
+func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	iam, err := getMapFieldValue(fields, "iam", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(iam) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	roleInUrl := path.Base(r.URL.Path)
+	roleInMetadata, err := getScalarFieldValue(iam, "role-name", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if strings.Compare(roleInUrl, roleInMetadata) != 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	creds, err := getMapFieldValue(
+		iam, "credentials", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(creds) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	} else {
+		data, err := json.MarshalIndent(creds, "", "  ")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		} else {
+			fmt.Fprintf(w, "%s", data)
+		}
+	}
+}
+
 func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 	iff, err := net.InterfaceByName(iface)
 	if err != nil {
@@ -462,6 +595,10 @@ func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dom, err := getScalarFieldValue(services, "domain", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if dom == "" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
