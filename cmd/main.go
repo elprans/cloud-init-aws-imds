@@ -470,6 +470,11 @@ func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/latest/meta-data/iam/security-credentials/" {
+		iamSecurityCredentialsListHandler(w, r)
+		return
+	}
+
 	fields, err := getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
