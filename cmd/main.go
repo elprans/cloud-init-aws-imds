@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,13 +12,58 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
+	"github.com/aws/aws-sdk-go/aws/session"
 )
+
+const (
+	minRefreshInterval = 5 * time.Minute
+)
+
+type IMDSCredentials struct {
+	AccessKeyId     string
+	Code            string
+	Expiration      string
+	LastUpdated     string
+	SecretAccessKey string
+	Token           string
+	Type            string
+}
+
+var iamRoleArn string
+var iamCredentials *credentials.Credentials
+var imdsCredentials *IMDSCredentials
 
 func main() {
 	fs := flag.NewFlagSet("nocloud-imds", flag.ExitOnError)
 	options := GetOptions(fs)
+
+	var err error
+
+	iamCredentials, imdsCredentials, iamRoleArn, err = getIAMCredentials()
+	if err != nil {
+		klog.Fatalf(
+			"could not fetch IAM credentials from metadata: %s",
+			err,
+		)
+	}
+
+	if iamCredentials != nil {
+		config := getAWSConfig(iamCredentials)
+		go credRefreshLoop(config)
+	}
+
+	http.HandleFunc(
+		"/latest/api/token",
+		tokenHandler,
+	)
 
 	http.HandleFunc(
 		"/latest/meta-data/ami-id",
@@ -140,6 +186,101 @@ func main() {
 	))
 }
 
+func getAWSConfig(creds *credentials.Credentials) *aws.Config {
+	fields, err := getV1StandardMetadata()
+	if err != nil {
+		klog.Fatalf("cannot load metadata: %s", err)
+	}
+	region, err := getScalarFieldValue(fields, "region", "")
+	if err != nil {
+		klog.Fatalf("region not in metadata: %s", err)
+	}
+
+	klog.Infof("AWS region: %s", region)
+	config := aws.NewConfig().WithRegion(region).WithCredentials(creds)
+	endpointData, err := getEndpoints()
+	if err != nil {
+		klog.Fatalf("could not parse AWS endpoints in metadata: %s", err)
+	}
+
+	if len(endpointData) != 0 {
+		endpointResolver := func(
+			service,
+			region string,
+			optFns ...func(*endpoints.Options),
+		) (endpoints.ResolvedEndpoint, error) {
+			if url, ok := endpointData[service]; ok {
+				klog.Infof("AWS endpoint for %s: %s", service, url)
+				return endpoints.ResolvedEndpoint{URL: url}, nil
+			} else {
+				return endpoints.DefaultResolver().EndpointFor(
+					service, region, optFns...)
+			}
+		}
+		config = config.WithEndpointResolver(
+			endpoints.ResolverFunc(endpointResolver))
+	}
+
+	return config
+}
+
+func credRefreshLoop(config *aws.Config) {
+	for {
+		sess, err := session.NewSession(config)
+		if err != nil {
+			klog.Fatalf("could not create AWS session: %v", err)
+			continue
+		}
+
+		credentials := stscreds.NewCredentials(sess, iamRoleArn)
+		creds, err := credentials.Get()
+		if err != nil {
+			klog.Errorf("could not refresh credentials: %v", err)
+			continue
+		}
+		sess.Config.Credentials = credentials
+		iamCredentials = credentials
+		imdsCredentials.AccessKeyId = creds.AccessKeyID
+		imdsCredentials.SecretAccessKey = creds.SecretAccessKey
+		imdsCredentials.Token = creds.SessionToken
+		expiresAt, err := iamCredentials.ExpiresAt()
+		if err != nil {
+			klog.Errorf("could not obtain credentials expiry: %v", err)
+			continue
+		}
+		imdsCredentials.Expiration = expiresAt.Format(time.RFC3339)
+		imdsCredentials.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+
+		config = config.WithCredentials(credentials)
+		nextRefresh := getCredRefreshInterval(config)
+
+		if credentials.IsExpired() {
+			klog.Warning(
+				"credentials refreshed successfully, but are still expired")
+		} else {
+			klog.Infof("credentials refreshed successfully, next refresh in %s",
+				nextRefresh.String())
+		}
+
+		time.Sleep(nextRefresh)
+	}
+}
+
+func getCredRefreshInterval(config *aws.Config) time.Duration {
+	expiresAt, err := config.Credentials.ExpiresAt()
+	if err != nil {
+		return minRefreshInterval
+	} else {
+		remainingDuration := expiresAt.Sub(time.Now().UTC())
+		refreshInterval := remainingDuration / 2
+		if refreshInterval < minRefreshInterval {
+			refreshInterval = minRefreshInterval
+		}
+
+		return refreshInterval
+	}
+}
+
 func logRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		klog.V(5).Infof("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
@@ -254,13 +395,16 @@ func getMapFieldValue(
 		}
 	}
 
+	if val == nil {
+		return nil, nil
+	}
+
 	switch v := val.(type) {
 	case map[string]interface{}:
 		return v, nil
 	default:
 		klog.Errorf("'%s' metadata value is not a map\n", name)
-		return nil, errors.New(
-			fmt.Sprintf("%s value is not a map", name))
+		return nil, fmt.Errorf("%s value is not a map", name)
 	}
 }
 
@@ -326,6 +470,54 @@ func formatDSFields(
 	}
 
 	return formatFields(format, fields, names...)
+}
+
+func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, error) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		return nil, nil, "", err
+	}
+	iam, err := getMapFieldValue(fields, "iam", make(map[string]interface{}))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if len(iam) == 0 {
+		return nil, nil, "", nil
+	}
+	role, err := getScalarFieldValue(iam, "role-arn", "")
+	if err != nil {
+		return nil, nil, "", err
+	}
+	creds, err := getMapFieldValue(
+		iam, "credentials", make(map[string]interface{}))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if len(creds) == 0 {
+		return nil, nil, "", nil
+	} else {
+		klog.Info("loaded IAM credentials from metadata")
+		iamCreds := credentials.NewStaticCredentials(
+			creds["AccessKeyId"].(string),
+			creds["SecretAccessKey"].(string),
+			creds["Token"].(string),
+		)
+		imdsCreds := &IMDSCredentials{
+			AccessKeyId:     creds["AccessKeyId"].(string),
+			SecretAccessKey: creds["SecretAccessKey"].(string),
+			Token:           creds["Token"].(string),
+			Code:            creds["Code"].(string),
+			Expiration:      creds["Expiration"].(string),
+			LastUpdated:     creds["LastUpdated"].(string),
+			Type:            creds["Type"].(string),
+		}
+		return iamCreds, imdsCreds, role, nil
+	}
+}
+
+func tokenHandler(w http.ResponseWriter, r *http.Request) {
+	token := base64.URLEncoding.EncodeToString([]byte("dummytoken"))
+	fmt.Fprintf(w, "%s", token)
 }
 
 func amiIdHandler(w http.ResponseWriter, r *http.Request) {
@@ -503,17 +695,11 @@ func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	creds, err := getMapFieldValue(
-		iam, "credentials", make(map[string]interface{}))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if len(creds) == 0 {
+	if iamCredentials == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	} else {
-		data, err := json.MarshalIndent(creds, "", "  ")
+		data, err := json.MarshalIndent(imdsCredentials, "", "  ")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		} else {
@@ -610,6 +796,33 @@ func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Fprintf(w, "%s", dom)
 	}
+}
+
+func getEndpoints() (map[string]string, error) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	services, err := getMapFieldValue(fields, "services", nil)
+	if err != nil {
+		return nil, err
+	}
+	if services == nil {
+		return nil, nil
+	}
+
+	endpoints, err := getMapFieldValue(services, "endpoints", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string, len(endpoints))
+	for k, v := range endpoints {
+		result[k] = v.(string)
+	}
+
+	return result, nil
 }
 
 func servicesEndpointsHandler(w http.ResponseWriter, r *http.Request) {
