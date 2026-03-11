@@ -37,6 +37,30 @@ type IMDSCredentials struct {
 	Type            string
 }
 
+// InstanceDataSource reads parsed instance metadata.
+type InstanceDataSource interface {
+	GetInstanceData() (map[string]interface{}, error)
+}
+
+type fileInstanceData struct {
+	path string
+}
+
+func (f *fileInstanceData) GetInstanceData() (map[string]interface{}, error) {
+	data, err := ioutil.ReadFile(f.path)
+	if err != nil {
+		klog.Errorf("%s\n", err.Error())
+		return nil, err
+	}
+	jsonMap := make(map[string]interface{})
+	if err := json.Unmarshal(data, &jsonMap); err != nil {
+		return nil, err
+	}
+	return jsonMap, nil
+}
+
+var dataSource InstanceDataSource
+
 var iamRoleArn string
 var iamCredentials *credentials.Credentials
 var imdsCredentials *IMDSCredentials
@@ -44,6 +68,10 @@ var imdsCredentials *IMDSCredentials
 func main() {
 	fs := flag.NewFlagSet("nocloud-imds", flag.ExitOnError)
 	options := GetOptions(fs)
+
+	dataSource = &fileInstanceData{
+		path: "/run/cloud-init/instance-data.json",
+	}
 
 	var err error
 
@@ -55,7 +83,7 @@ func main() {
 		)
 	}
 
-	if iamCredentials != nil {
+	if iamCredentials != nil && iamRoleArn != "" {
 		config := getAWSConfig(iamCredentials)
 		go credRefreshLoop(config)
 	}
@@ -161,6 +189,21 @@ func main() {
 	http.HandleFunc(
 		"/latest/meta-data/placement/availability-zone",
 		placementAvailabilityZoneHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/tags/instance/",
+		tagsInstanceHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/tags/instance",
+		tagsInstanceHandler,
+	)
+
+	http.HandleFunc(
+		"/latest/meta-data/autoscaling/target-lifecycle-state",
+		autoscalingLifecycleStateHandler,
 	)
 
 	http.HandleFunc(
@@ -289,19 +332,7 @@ func logRequest(handler http.Handler) http.Handler {
 }
 
 func getInstanceData() (map[string]interface{}, error) {
-	data, err := ioutil.ReadFile("/run/cloud-init/instance-data.json")
-	if err != nil {
-		klog.Errorf("%s\n", err.Error())
-		return nil, err
-	}
-
-	jsonMap := make(map[string]interface{})
-	err = json.Unmarshal(data, &jsonMap)
-	if err != nil {
-		return nil, err
-	}
-
-	return jsonMap, nil
+	return dataSource.GetInstanceData()
 }
 
 func getV1StandardMetadata() (map[string]interface{}, error) {
@@ -484,10 +515,7 @@ func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, er
 	if len(iam) == 0 {
 		return nil, nil, "", nil
 	}
-	role, err := getScalarFieldValue(iam, "role-arn", "")
-	if err != nil {
-		return nil, nil, "", err
-	}
+	role, _ := getScalarFieldValue(iam, "role-arn", "")
 	creds, err := getMapFieldValue(
 		iam, "credentials", make(map[string]interface{}))
 	if err != nil {
@@ -575,6 +603,7 @@ func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
 	ipString, err := getLocalIPv4Address(iface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	fmt.Fprintf(w, "%s", ipString)
 }
@@ -712,6 +741,7 @@ func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 	iff, err := net.InterfaceByName(iface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	fmt.Fprintf(w, "%s", iff.HardwareAddr.String())
 }
@@ -720,6 +750,7 @@ func macsHandler(w http.ResponseWriter, r *http.Request) {
 	iff, err := net.Interfaces()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	for i, iface := range iff {
@@ -734,6 +765,7 @@ func blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
 	devices, err := getBlockDevices()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	i := 0
@@ -750,11 +782,13 @@ func blockDeviceMappingHandler(w http.ResponseWriter, r *http.Request) {
 	devices, err := getBlockDevices()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	device := path.Base(r.URL.Path)
 	path, ok := devices[device]
 	if !ok {
 		http.Error(w, "No such device", http.StatusNotFound)
+		return
 	}
 	fmt.Fprintf(w, "%s", path)
 }
@@ -938,6 +972,83 @@ func instanceIdentityHandler(
 	}
 
 	w.Write(jsonData)
+}
+
+func tagsInstanceHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tags, err := getMapFieldValue(fields, "tags", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(tags) == 0 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Strip trailing slash and prefix to get the tag key
+	reqPath := strings.TrimSuffix(r.URL.Path, "/")
+	prefix := "/latest/meta-data/tags/instance"
+
+	if reqPath == prefix {
+		// List all tag keys
+		i := 0
+		for key := range tags {
+			if i > 0 {
+				fmt.Fprintf(w, "\n")
+			}
+			fmt.Fprintf(w, "%s", key)
+			i++
+		}
+		return
+	}
+
+	// Get specific tag value
+	tagKey := strings.TrimPrefix(reqPath, prefix+"/")
+	if tagKey == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	val, ok := tags[tagKey]
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	fmt.Fprintf(w, "%s", val.(string))
+}
+
+func autoscalingLifecycleStateHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := getDSMetadata()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	autoscaling, err := getMapFieldValue(
+		fields, "autoscaling", make(map[string]interface{}))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(autoscaling) == 0 {
+		fmt.Fprintf(w, "InService")
+		return
+	}
+
+	state, err := getScalarFieldValue(
+		autoscaling, "target_lifecycle_state", "InService")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "%s", state)
 }
 
 func getBlockDevices() (map[string]string, error) {
