@@ -277,8 +277,8 @@ func TestTokenHandlerRejectsXForwardedFor(t *testing.T) {
 // --- Middleware tests (Server header, Content-Type, method enforcement) ---
 
 func TestMiddlewareServerHeader(t *testing.T) {
-	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok")) //nolint:errcheck
 	}))
 	req := httptest.NewRequest("GET", "/latest/meta-data/instance-id", nil)
 	w := httptest.NewRecorder()
@@ -290,8 +290,8 @@ func TestMiddlewareServerHeader(t *testing.T) {
 }
 
 func TestMiddlewareContentType(t *testing.T) {
-	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok")) //nolint:errcheck
 	}))
 	req := httptest.NewRequest("GET", "/latest/meta-data/instance-id", nil)
 	w := httptest.NewRecorder()
@@ -303,8 +303,8 @@ func TestMiddlewareContentType(t *testing.T) {
 }
 
 func TestMiddlewareRejectsPostOnMetadata(t *testing.T) {
-	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok")) //nolint:errcheck
 	}))
 	req := httptest.NewRequest("POST", "/latest/meta-data/instance-id", nil)
 	w := httptest.NewRecorder()
@@ -316,8 +316,8 @@ func TestMiddlewareRejectsPostOnMetadata(t *testing.T) {
 }
 
 func TestMiddlewareAllowsPutOnToken(t *testing.T) {
-	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+	handler := logRequest(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok")) //nolint:errcheck
 	}))
 	req := httptest.NewRequest("PUT", "/latest/api/token", nil)
 	w := httptest.NewRecorder()
@@ -351,8 +351,8 @@ func TestIamInfoHandler(t *testing.T) {
 	if info.InstanceProfileArn != "arn:aws:iam::123456789012:instance-profile/test-profile" {
 		t.Errorf("unexpected InstanceProfileArn: %q", info.InstanceProfileArn)
 	}
-	if info.InstanceProfileId != "AIPA1234567890" {
-		t.Errorf("unexpected InstanceProfileId: %q", info.InstanceProfileId)
+	if info.InstanceProfileID != "AIPA1234567890" {
+		t.Errorf("unexpected InstanceProfileId: %q", info.InstanceProfileID)
 	}
 	if info.LastUpdated == "" {
 		t.Error("expected non-empty LastUpdated")

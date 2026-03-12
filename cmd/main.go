@@ -6,9 +6,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -31,13 +31,13 @@ const (
 var serverStartTime = time.Now().UTC()
 
 type IMDSCredentials struct {
-	AccessKeyId     string
-	Code            string
-	Expiration      string
-	LastUpdated     string
-	SecretAccessKey string
-	Token           string
-	Type            string
+	AccessKeyID     string `json:"AccessKeyId"`
+	Code            string `json:"Code"`
+	Expiration      string `json:"Expiration"`
+	LastUpdated     string `json:"LastUpdated"`
+	SecretAccessKey string `json:"SecretAccessKey"`
+	Token           string `json:"Token"`
+	Type            string `json:"Type"`
 }
 
 // InstanceDataSource reads parsed instance metadata.
@@ -50,7 +50,7 @@ type fileInstanceData struct {
 }
 
 func (f *fileInstanceData) GetInstanceData() (map[string]interface{}, error) {
-	data, err := ioutil.ReadFile(f.path)
+	data, err := os.ReadFile(f.path)
 	if err != nil {
 		klog.Errorf("%s\n", err.Error())
 		return nil, err
@@ -98,12 +98,12 @@ func main() {
 
 	http.HandleFunc(
 		"/latest/meta-data/ami-id",
-		amiIdHandler,
+		amiIDHandler,
 	)
 
 	http.HandleFunc(
 		"/latest/meta-data/instance-id",
-		instanceIdHandler,
+		instanceIDHandler,
 	)
 
 	http.HandleFunc(
@@ -258,10 +258,9 @@ func getAWSConfig(creds *credentials.Credentials) *aws.Config {
 			if url, ok := endpointData[service]; ok {
 				klog.Infof("AWS endpoint for %s: %s", service, url)
 				return endpoints.ResolvedEndpoint{URL: url}, nil
-			} else {
-				return endpoints.DefaultResolver().EndpointFor(
-					service, region, optFns...)
 			}
+			return endpoints.DefaultResolver().EndpointFor(
+				service, region, optFns...)
 		}
 		config = config.WithEndpointResolver(
 			endpoints.ResolverFunc(endpointResolver))
@@ -286,7 +285,7 @@ func credRefreshLoop(config *aws.Config) {
 		}
 		sess.Config.Credentials = credentials
 		iamCredentials = credentials
-		imdsCredentials.AccessKeyId = creds.AccessKeyID
+		imdsCredentials.AccessKeyID = creds.AccessKeyID
 		imdsCredentials.SecretAccessKey = creds.SecretAccessKey
 		imdsCredentials.Token = creds.SessionToken
 		expiresAt, err := iamCredentials.ExpiresAt()
@@ -316,15 +315,13 @@ func getCredRefreshInterval(config *aws.Config) time.Duration {
 	expiresAt, err := config.Credentials.ExpiresAt()
 	if err != nil {
 		return minRefreshInterval
-	} else {
-		remainingDuration := expiresAt.Sub(time.Now().UTC())
-		refreshInterval := remainingDuration / 2
-		if refreshInterval < minRefreshInterval {
-			refreshInterval = minRefreshInterval
-		}
-
-		return refreshInterval
 	}
+	remainingDuration := expiresAt.Sub(time.Now().UTC())
+	refreshInterval := remainingDuration / 2
+	if refreshInterval < minRefreshInterval {
+		refreshInterval = minRefreshInterval
+	}
+	return refreshInterval
 }
 
 func logRequest(handler http.Handler) http.Handler {
@@ -350,33 +347,31 @@ func getV1StandardMetadata() (map[string]interface{}, error) {
 	idata, err := getInstanceData()
 	if err != nil {
 		return nil, err
-	} else {
-		fields, found := idata["v1"]
-		if !found {
-			klog.Errorf("v1 is missing or malformed\n")
-			return nil, errors.New("v1 metadata is missing or malformed")
-		}
-		return fields.(map[string]interface{}), nil
 	}
+	fields, found := idata["v1"]
+	if !found {
+		klog.Errorf("v1 is missing or malformed\n")
+		return nil, errors.New("v1 metadata is missing or malformed")
+	}
+	return fields.(map[string]interface{}), nil
 }
 
 func getDSMetadata() (map[string]interface{}, error) {
 	idata, err := getInstanceData()
 	if err != nil {
 		return nil, err
-	} else {
-		ds, found := idata["ds"]
-		if !found {
-			klog.Errorf("ds metadata is missing or malformed\n")
-			return nil, errors.New("ds metadata is missing or malformed")
-		}
-		fields, found := ds.(map[string]interface{})["meta_data"]
-		if !found {
-			klog.Errorf("ds metadata is missing or malformed\n")
-			return nil, errors.New("ds metadata is missing or malformed")
-		}
-		return fields.(map[string]interface{}), nil
 	}
+	ds, found := idata["ds"]
+	if !found {
+		klog.Errorf("ds metadata is missing or malformed\n")
+		return nil, errors.New("ds metadata is missing or malformed")
+	}
+	fields, found := ds.(map[string]interface{})["meta_data"]
+	if !found {
+		klog.Errorf("ds metadata is missing or malformed\n")
+		return nil, errors.New("ds metadata is missing or malformed")
+	}
+	return fields.(map[string]interface{}), nil
 }
 
 func getScalarFieldValue(
@@ -394,11 +389,9 @@ func getScalarFieldValue(
 			if !found {
 				if deflt != "" {
 					return deflt, nil
-				} else {
-					klog.Errorf("'%s' metadata value is missing\n", name)
-					return "", errors.New(
-						fmt.Sprintf("%s is missing in metadata", name))
 				}
+				klog.Errorf("'%s' metadata value is missing\n", name)
+				return "", fmt.Errorf("%s is missing in metadata", name)
 			}
 		}
 	}
@@ -408,8 +401,7 @@ func getScalarFieldValue(
 		return v, nil
 	default:
 		klog.Errorf("'%s' metadata value is not a string\n", name)
-		return "", errors.New(
-			fmt.Sprintf("%s value is not a string", name))
+		return "", fmt.Errorf("%s value is not a string", name)
 	}
 }
 
@@ -428,11 +420,9 @@ func getMapFieldValue(
 			if !found {
 				if deflt != nil {
 					return deflt, nil
-				} else {
-					klog.Errorf("'%s' metadata value is missing\n", name)
-					return nil, errors.New(
-						fmt.Sprintf("%s is missing in metadata", name))
 				}
+				klog.Errorf("'%s' metadata value is missing\n", name)
+				return nil, fmt.Errorf("%s is missing in metadata", name)
 			}
 		}
 	}
@@ -534,24 +524,23 @@ func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, er
 	}
 	if len(creds) == 0 {
 		return nil, nil, "", nil
-	} else {
-		klog.Info("loaded IAM credentials from metadata")
-		iamCreds := credentials.NewStaticCredentials(
-			creds["AccessKeyId"].(string),
-			creds["SecretAccessKey"].(string),
-			creds["Token"].(string),
-		)
-		imdsCreds := &IMDSCredentials{
-			AccessKeyId:     creds["AccessKeyId"].(string),
-			SecretAccessKey: creds["SecretAccessKey"].(string),
-			Token:           creds["Token"].(string),
-			Code:            creds["Code"].(string),
-			Expiration:      creds["Expiration"].(string),
-			LastUpdated:     creds["LastUpdated"].(string),
-			Type:            creds["Type"].(string),
-		}
-		return iamCreds, imdsCreds, role, nil
 	}
+	klog.Info("loaded IAM credentials from metadata")
+	iamCreds := credentials.NewStaticCredentials(
+		creds["AccessKeyId"].(string),
+		creds["SecretAccessKey"].(string),
+		creds["Token"].(string),
+	)
+	imdsCreds := &IMDSCredentials{
+		AccessKeyID:     creds["AccessKeyId"].(string),
+		SecretAccessKey: creds["SecretAccessKey"].(string),
+		Token:           creds["Token"].(string),
+		Code:            creds["Code"].(string),
+		Expiration:      creds["Expiration"].(string),
+		LastUpdated:     creds["LastUpdated"].(string),
+		Type:            creds["Type"].(string),
+	}
+	return iamCreds, imdsCreds, role, nil
 }
 
 func tokenHandler(w http.ResponseWriter, r *http.Request) {
@@ -576,22 +565,22 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", token)
 }
 
-func amiIdHandler(w http.ResponseWriter, r *http.Request) {
+func amiIDHandler(w http.ResponseWriter, _ *http.Request) {
 	val, err := formatV1Fields("%s-%s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		fmt.Fprintf(w, "%s", val)
+		return
 	}
+	fmt.Fprintf(w, "%s", val)
 }
 
-func localHostnameHandler(w http.ResponseWriter, r *http.Request) {
+func localHostnameHandler(w http.ResponseWriter, _ *http.Request) {
 	val, err := formatDSFields("%s", "local_hostname")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		fmt.Fprintf(w, "%s", val)
+		return
 	}
+	fmt.Fprintf(w, "%s", val)
 }
 
 func getLocalIPv4Address(iface string) (string, error) {
@@ -627,7 +616,7 @@ func getLocalIPv4Address(iface string) (string, error) {
 	return ipString, nil
 }
 
-func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
+func localIPv4Handler(w http.ResponseWriter, _ *http.Request, iface string) {
 	ipString, err := getLocalIPv4Address(iface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -636,22 +625,22 @@ func localIPv4Handler(w http.ResponseWriter, r *http.Request, iface string) {
 	fmt.Fprintf(w, "%s", ipString)
 }
 
-func instanceIdHandler(w http.ResponseWriter, r *http.Request) {
+func instanceIDHandler(w http.ResponseWriter, r *http.Request) {
 	val, err := formatV1Fields("%s", "instance_id")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		fmt.Fprintf(w, "%s", val)
+		return
 	}
+	fmt.Fprintf(w, "%s", val)
 }
 
 func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
 	instType, err := getDSFieldValue("instance_type", "t2.micro")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		fmt.Fprintf(w, "%s", instType)
+		return
 	}
+	fmt.Fprintf(w, "%s", instType)
 }
 
 // iamInfoResponse matches the JSON structure returned by real AWS IMDS at
@@ -660,7 +649,7 @@ type iamInfoResponse struct {
 	Code               string `json:"Code"`
 	LastUpdated        string `json:"LastUpdated"`
 	InstanceProfileArn string `json:"InstanceProfileArn"`
-	InstanceProfileId  string `json:"InstanceProfileId"`
+	InstanceProfileID  string `json:"InstanceProfileId"`
 }
 
 func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
@@ -697,7 +686,7 @@ func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
 		Code:               "Success",
 		LastUpdated:        time.Now().UTC().Format(time.RFC3339),
 		InstanceProfileArn: arn,
-		InstanceProfileId:  id,
+		InstanceProfileID:  id,
 	}
 
 	data, err := json.MarshalIndent(info, "", "  ")
@@ -732,9 +721,8 @@ func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
 	if roleName == "" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	} else {
-		fmt.Fprintf(w, "%s", roleName)
 	}
+	fmt.Fprintf(w, "%s", roleName)
 }
 
 func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
@@ -759,14 +747,14 @@ func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	roleInUrl := path.Base(r.URL.Path)
+	roleInURL := path.Base(r.URL.Path)
 	roleInMetadata, err := getScalarFieldValue(iam, "role-name", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if strings.Compare(roleInUrl, roleInMetadata) != 0 {
+	if strings.Compare(roleInURL, roleInMetadata) != 0 {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -774,14 +762,13 @@ func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 	if iamCredentials == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	} else {
-		data, err := json.MarshalIndent(imdsCredentials, "", "  ")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		} else {
-			fmt.Fprintf(w, "%s", data)
-		}
 	}
+	data, err := json.MarshalIndent(imdsCredentials, "", "  ")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "%s", data)
 }
 
 func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
@@ -831,7 +818,7 @@ func blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "\n")
 		}
 		fmt.Fprintf(w, "%s", dev)
-		i += 1
+		i++
 	}
 }
 
@@ -854,9 +841,9 @@ func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
 	az, err := getV1FieldValue("availability_zone", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		fmt.Fprintf(w, "%s", az)
+		return
 	}
+	fmt.Fprintf(w, "%s", az)
 }
 
 func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
@@ -884,9 +871,8 @@ func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
 	if dom == "" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	} else {
-		fmt.Fprintf(w, "%s", dom)
 	}
+	fmt.Fprintf(w, "%s", dom)
 }
 
 func getEndpoints() (map[string]string, error) {
@@ -1000,7 +986,7 @@ func instanceIdentityHandler(
 		return
 	}
 
-	instId, err := getScalarFieldValue(fields, "instance_id", "")
+	instID, err := getScalarFieldValue(fields, "instance_id", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1012,7 +998,7 @@ func instanceIdentityHandler(
 		return
 	}
 
-	imageId, err := formatV1Fields("%s %s", "distro", "distro_release")
+	imageID, err := formatV1Fields("%s %s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1042,11 +1028,11 @@ func instanceIdentityHandler(
 		AvailabilityZone:        az,
 		PrivateIP:               ipString,
 		Version:                 "2017-09-30",
-		InstanceID:              instId,
+		InstanceID:              instID,
 		BillingProducts:         nil,
 		InstanceType:            instType,
 		AccountID:               options.AccountID,
-		ImageID:                 imageId,
+		ImageID:                 imageID,
 		PendingTime:             serverStartTime.Format(time.RFC3339),
 		Architecture:            machine,
 		KernelID:                nil,
@@ -1142,7 +1128,7 @@ func autoscalingLifecycleStateHandler(w http.ResponseWriter, r *http.Request) {
 
 func getBlockDevices() (map[string]string, error) {
 	disks := "/dev/disk/by-label"
-	dir, err := ioutil.ReadDir(disks)
+	dir, err := os.ReadDir(disks)
 	if err != nil {
 		return nil, err
 	}

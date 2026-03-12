@@ -7,19 +7,29 @@ on:
   workflow_dispatch:
     inputs: {}
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
 jobs:
   build:
+    name: Build and publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create GitHub releases
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 50
+        persist-credentials: false
 
     - name: Setup Go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v5
       with:
-        go-version: '^1.18.2'
+        go-version: '^1.22'
+        cache: false
 
     - name: Build
       run: |
