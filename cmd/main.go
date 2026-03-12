@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -27,8 +28,6 @@ import (
 const (
 	minRefreshInterval = 5 * time.Minute
 )
-
-var serverStartTime = time.Now().UTC()
 
 type IMDSCredentials struct {
 	AccessKeyID     string `json:"AccessKeyId"`
@@ -62,23 +61,92 @@ func (f *fileInstanceData) GetInstanceData() (map[string]interface{}, error) {
 	return jsonMap, nil
 }
 
-var dataSource InstanceDataSource
+// NetworkInfo abstracts network interface lookups for testability.
+type NetworkInfo interface {
+	InterfaceByName(name string) (*net.Interface, error)
+	Interfaces() ([]net.Interface, error)
+	InterfaceAddrs(iface *net.Interface) ([]net.Addr, error)
+}
 
-var iamRoleArn string
-var iamCredentials *credentials.Credentials
-var imdsCredentials *IMDSCredentials
+type realNetworkInfo struct{}
+
+func (realNetworkInfo) InterfaceByName(name string) (*net.Interface, error) {
+	return net.InterfaceByName(name)
+}
+
+func (realNetworkInfo) Interfaces() ([]net.Interface, error) {
+	return net.Interfaces()
+}
+
+func (realNetworkInfo) InterfaceAddrs(iface *net.Interface) ([]net.Addr, error) {
+	return iface.Addrs()
+}
+
+// BlockDeviceSource abstracts block device discovery for testability.
+type BlockDeviceSource interface {
+	GetBlockDevices() (map[string]string, error)
+}
+
+type realBlockDeviceSource struct{}
+
+func (realBlockDeviceSource) GetBlockDevices() (map[string]string, error) {
+	disks := "/dev/disk/by-label"
+	dir, err := os.ReadDir(disks)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string)
+
+	for _, f := range dir {
+		name := f.Name()
+		if strings.Compare(name, "UEFI") == 0 ||
+			strings.Compare(name, "cidata") == 0 {
+			continue
+		}
+
+		node, err := filepath.EvalSymlinks(path.Join(disks, name))
+		if err != nil {
+			continue
+		}
+
+		result[name] = node
+	}
+
+	return result, nil
+}
+
+// Server holds all state for the IMDS emulator.
+type Server struct {
+	dataSource   InstanceDataSource
+	startTime    time.Time
+	options      *Options
+	networkInfo  NetworkInfo
+	blockDevices BlockDeviceSource
+
+	// IAM credential state, protected by mutex.
+	iamMu      sync.RWMutex
+	iamRoleArn string
+	iamCreds   *credentials.Credentials
+	imdsCreds  *IMDSCredentials
+}
 
 func main() {
 	fs := flag.NewFlagSet("nocloud-imds", flag.ExitOnError)
 	options := GetOptions(fs)
 
-	dataSource = &fileInstanceData{
-		path: "/run/cloud-init/instance-data.json",
+	s := &Server{
+		dataSource: &fileInstanceData{
+			path: "/run/cloud-init/instance-data.json",
+		},
+		startTime:    time.Now().UTC(),
+		options:      options,
+		networkInfo:  realNetworkInfo{},
+		blockDevices: realBlockDeviceSource{},
 	}
 
 	var err error
-
-	iamCredentials, imdsCredentials, iamRoleArn, err = getIAMCredentials()
+	s.iamCreds, s.imdsCreds, s.iamRoleArn, err = s.getIAMCredentials()
 	if err != nil {
 		klog.Fatalf(
 			"could not fetch IAM credentials from metadata: %s",
@@ -86,154 +154,50 @@ func main() {
 		)
 	}
 
-	if iamCredentials != nil && iamRoleArn != "" {
-		config := getAWSConfig(iamCredentials)
-		go credRefreshLoop(config)
+	if s.iamCreds != nil && s.iamRoleArn != "" {
+		config := s.getAWSConfig(s.iamCreds)
+		go s.credRefreshLoop(config)
 	}
-
-	http.HandleFunc(
-		"/latest/api/token",
-		tokenHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/ami-id",
-		amiIDHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/instance-id",
-		instanceIDHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/instance-type",
-		instanceTypeHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/local-hostname",
-		localHostnameHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/public-hostname",
-		localHostnameHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/local-ipv4",
-		func(w http.ResponseWriter, r *http.Request) {
-			localIPv4Handler(w, r, options.NetIface)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/public-ipv4",
-		func(w http.ResponseWriter, r *http.Request) {
-			localIPv4Handler(w, r, options.NetIface)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/hostname",
-		localHostnameHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/mac",
-		func(w http.ResponseWriter, r *http.Request) {
-			macHandler(w, r, options.NetIface)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/network/interfaces/macs",
-		func(w http.ResponseWriter, r *http.Request) {
-			macsHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/block-device-mapping",
-		func(w http.ResponseWriter, r *http.Request) {
-			blockDeviceMappingListHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/block-device-mapping/",
-		func(w http.ResponseWriter, r *http.Request) {
-			blockDeviceMappingHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/iam/info",
-		func(w http.ResponseWriter, r *http.Request) {
-			iamInfoHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/iam/security-credentials",
-		func(w http.ResponseWriter, r *http.Request) {
-			iamSecurityCredentialsListHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/iam/security-credentials/",
-		func(w http.ResponseWriter, r *http.Request) {
-			iamSecurityCredentialsHandler(w, r)
-		},
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/placement/availability-zone",
-		placementAvailabilityZoneHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/tags/instance/",
-		tagsInstanceHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/tags/instance",
-		tagsInstanceHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/autoscaling/target-lifecycle-state",
-		autoscalingLifecycleStateHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/services/domain",
-		servicesDomainHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/meta-data/services/endpoints",
-		servicesEndpointsHandler,
-	)
-
-	http.HandleFunc(
-		"/latest/dynamic/instance-identity/document",
-		func(w http.ResponseWriter, r *http.Request) {
-			instanceIdentityHandler(w, r, options)
-		},
-	)
 
 	klog.Fatalln(http.ListenAndServe(
 		fmt.Sprintf("%s:%s", options.BindTo, options.Port),
-		logRequest(http.DefaultServeMux),
+		s.Handler(),
 	))
 }
 
-func getAWSConfig(creds *credentials.Credentials) *aws.Config {
-	fields, err := getV1StandardMetadata()
+// Handler returns an http.Handler with all IMDS routes registered.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/latest/api/token", s.tokenHandler)
+	mux.HandleFunc("/latest/meta-data/ami-id", s.amiIDHandler)
+	mux.HandleFunc("/latest/meta-data/instance-id", s.instanceIDHandler)
+	mux.HandleFunc("/latest/meta-data/instance-type", s.instanceTypeHandler)
+	mux.HandleFunc("/latest/meta-data/local-hostname", s.localHostnameHandler)
+	mux.HandleFunc("/latest/meta-data/public-hostname", s.localHostnameHandler)
+	mux.HandleFunc("/latest/meta-data/local-ipv4", s.localIPv4Handler)
+	mux.HandleFunc("/latest/meta-data/public-ipv4", s.localIPv4Handler)
+	mux.HandleFunc("/latest/meta-data/hostname", s.localHostnameHandler)
+	mux.HandleFunc("/latest/meta-data/mac", s.macHandler)
+	mux.HandleFunc("/latest/meta-data/network/interfaces/macs", s.macsHandler)
+	mux.HandleFunc("/latest/meta-data/block-device-mapping", s.blockDeviceMappingListHandler)
+	mux.HandleFunc("/latest/meta-data/block-device-mapping/", s.blockDeviceMappingHandler)
+	mux.HandleFunc("/latest/meta-data/iam/info", s.iamInfoHandler)
+	mux.HandleFunc("/latest/meta-data/iam/security-credentials", s.iamSecurityCredentialsListHandler)
+	mux.HandleFunc("/latest/meta-data/iam/security-credentials/", s.iamSecurityCredentialsHandler)
+	mux.HandleFunc("/latest/meta-data/placement/availability-zone", s.placementAvailabilityZoneHandler)
+	mux.HandleFunc("/latest/meta-data/tags/instance/", s.tagsInstanceHandler)
+	mux.HandleFunc("/latest/meta-data/tags/instance", s.tagsInstanceHandler)
+	mux.HandleFunc("/latest/meta-data/autoscaling/target-lifecycle-state", s.autoscalingLifecycleStateHandler)
+	mux.HandleFunc("/latest/meta-data/services/domain", s.servicesDomainHandler)
+	mux.HandleFunc("/latest/meta-data/services/endpoints", s.servicesEndpointsHandler)
+	mux.HandleFunc("/latest/dynamic/instance-identity/document", s.instanceIdentityHandler)
+
+	return s.logRequest(mux)
+}
+
+func (s *Server) getAWSConfig(creds *credentials.Credentials) *aws.Config {
+	fields, err := s.getV1StandardMetadata()
 	if err != nil {
 		klog.Fatalf("cannot load metadata: %s", err)
 	}
@@ -244,7 +208,7 @@ func getAWSConfig(creds *credentials.Credentials) *aws.Config {
 
 	klog.Infof("AWS region: %s", region)
 	config := aws.NewConfig().WithRegion(region).WithCredentials(creds)
-	endpointData, err := getEndpoints()
+	endpointData, err := s.getEndpoints()
 	if err != nil {
 		klog.Fatalf("could not parse AWS endpoints in metadata: %s", err)
 	}
@@ -269,7 +233,7 @@ func getAWSConfig(creds *credentials.Credentials) *aws.Config {
 	return config
 }
 
-func credRefreshLoop(config *aws.Config) {
+func (s *Server) credRefreshLoop(config *aws.Config) {
 	for {
 		sess, err := session.NewSession(config)
 		if err != nil {
@@ -277,24 +241,32 @@ func credRefreshLoop(config *aws.Config) {
 			continue
 		}
 
-		credentials := stscreds.NewCredentials(sess, iamRoleArn)
+		s.iamMu.RLock()
+		roleArn := s.iamRoleArn
+		s.iamMu.RUnlock()
+
+		credentials := stscreds.NewCredentials(sess, roleArn)
 		creds, err := credentials.Get()
 		if err != nil {
 			klog.Errorf("could not refresh credentials: %v", err)
 			continue
 		}
 		sess.Config.Credentials = credentials
-		iamCredentials = credentials
-		imdsCredentials.AccessKeyID = creds.AccessKeyID
-		imdsCredentials.SecretAccessKey = creds.SecretAccessKey
-		imdsCredentials.Token = creds.SessionToken
-		expiresAt, err := iamCredentials.ExpiresAt()
+
+		s.iamMu.Lock()
+		s.iamCreds = credentials
+		s.imdsCreds.AccessKeyID = creds.AccessKeyID
+		s.imdsCreds.SecretAccessKey = creds.SecretAccessKey
+		s.imdsCreds.Token = creds.SessionToken
+		expiresAt, err := s.iamCreds.ExpiresAt()
 		if err != nil {
+			s.iamMu.Unlock()
 			klog.Errorf("could not obtain credentials expiry: %v", err)
 			continue
 		}
-		imdsCredentials.Expiration = expiresAt.Format(time.RFC3339)
-		imdsCredentials.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+		s.imdsCreds.Expiration = expiresAt.Format(time.RFC3339)
+		s.imdsCreds.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+		s.iamMu.Unlock()
 
 		config = config.WithCredentials(credentials)
 		nextRefresh := getCredRefreshInterval(config)
@@ -324,7 +296,7 @@ func getCredRefreshInterval(config *aws.Config) time.Duration {
 	return refreshInterval
 }
 
-func logRequest(handler http.Handler) http.Handler {
+func (s *Server) logRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		klog.V(5).Infof("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
 		w.Header().Set("Server", "EC2ws")
@@ -339,12 +311,12 @@ func logRequest(handler http.Handler) http.Handler {
 	})
 }
 
-func getInstanceData() (map[string]interface{}, error) {
-	return dataSource.GetInstanceData()
+func (s *Server) getInstanceData() (map[string]interface{}, error) {
+	return s.dataSource.GetInstanceData()
 }
 
-func getV1StandardMetadata() (map[string]interface{}, error) {
-	idata, err := getInstanceData()
+func (s *Server) getV1StandardMetadata() (map[string]interface{}, error) {
+	idata, err := s.getInstanceData()
 	if err != nil {
 		return nil, err
 	}
@@ -356,8 +328,8 @@ func getV1StandardMetadata() (map[string]interface{}, error) {
 	return fields.(map[string]interface{}), nil
 }
 
-func getDSMetadata() (map[string]interface{}, error) {
-	idata, err := getInstanceData()
+func (s *Server) getDSMetadata() (map[string]interface{}, error) {
+	idata, err := s.getInstanceData()
 	if err != nil {
 		return nil, err
 	}
@@ -440,26 +412,50 @@ func getMapFieldValue(
 	}
 }
 
-func getV1FieldValue(
+func (s *Server) getV1FieldValue(
 	name string,
 	deflt string,
 ) (string, error) {
-	fields, err := getV1StandardMetadata()
+	fields, err := s.getV1StandardMetadata()
 	if err != nil {
 		return "", err
 	}
 	return getScalarFieldValue(fields, name, deflt)
 }
 
-func getDSFieldValue(
+func (s *Server) getDSFieldValue(
 	name string,
 	deflt string,
 ) (string, error) {
-	fields, err := getDSMetadata()
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		return "", err
 	}
 	return getScalarFieldValue(fields, name, deflt)
+}
+
+func (s *Server) formatV1Fields(
+	format string,
+	names ...string,
+) (string, error) {
+	fields, err := s.getV1StandardMetadata()
+	if err != nil {
+		return "", err
+	}
+
+	return formatFields(format, fields, names...)
+}
+
+func (s *Server) formatDSFields(
+	format string,
+	names ...string,
+) (string, error) {
+	fields, err := s.getDSMetadata()
+	if err != nil {
+		return "", err
+	}
+
+	return formatFields(format, fields, names...)
 }
 
 func formatFields(
@@ -480,32 +476,8 @@ func formatFields(
 	return fmt.Sprintf(format, vals...), nil
 }
 
-func formatV1Fields(
-	format string,
-	names ...string,
-) (string, error) {
-	fields, err := getV1StandardMetadata()
-	if err != nil {
-		return "", err
-	}
-
-	return formatFields(format, fields, names...)
-}
-
-func formatDSFields(
-	format string,
-	names ...string,
-) (string, error) {
-	fields, err := getDSMetadata()
-	if err != nil {
-		return "", err
-	}
-
-	return formatFields(format, fields, names...)
-}
-
-func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, error) {
-	fields, err := getDSMetadata()
+func (s *Server) getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, error) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -543,7 +515,14 @@ func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, er
 	return iamCreds, imdsCreds, role, nil
 }
 
-func tokenHandler(w http.ResponseWriter, r *http.Request) {
+// getIMDSCredentials returns a snapshot of the current IMDS credentials.
+func (s *Server) getIMDSCredentials() (*credentials.Credentials, *IMDSCredentials) {
+	s.iamMu.RLock()
+	defer s.iamMu.RUnlock()
+	return s.iamCreds, s.imdsCreds
+}
+
+func (s *Server) tokenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
@@ -561,12 +540,13 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+	w.Header().Set("X-Aws-Ec2-Metadata-Token-Ttl-Seconds", ttl)
 	token := base64.URLEncoding.EncodeToString([]byte("dummytoken"))
 	fmt.Fprintf(w, "%s", token)
 }
 
-func amiIDHandler(w http.ResponseWriter, _ *http.Request) {
-	val, err := formatV1Fields("%s-%s", "distro", "distro_release")
+func (s *Server) amiIDHandler(w http.ResponseWriter, _ *http.Request) {
+	val, err := s.formatV1Fields("%s-%s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -574,8 +554,8 @@ func amiIDHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "%s", val)
 }
 
-func localHostnameHandler(w http.ResponseWriter, _ *http.Request) {
-	val, err := formatDSFields("%s", "local_hostname")
+func (s *Server) localHostnameHandler(w http.ResponseWriter, _ *http.Request) {
+	val, err := s.formatDSFields("%s", "local_hostname")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -583,13 +563,13 @@ func localHostnameHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "%s", val)
 }
 
-func getLocalIPv4Address(iface string) (string, error) {
-	iff, err := net.InterfaceByName(iface)
+func (s *Server) getLocalIPv4Address(iface string) (string, error) {
+	iff, err := s.networkInfo.InterfaceByName(iface)
 	if err != nil {
 		return "", err
 	}
 
-	addrs, err := iff.Addrs()
+	addrs, err := s.networkInfo.InterfaceAddrs(iff)
 	if err != nil {
 		return "", err
 	}
@@ -616,8 +596,8 @@ func getLocalIPv4Address(iface string) (string, error) {
 	return ipString, nil
 }
 
-func localIPv4Handler(w http.ResponseWriter, _ *http.Request, iface string) {
-	ipString, err := getLocalIPv4Address(iface)
+func (s *Server) localIPv4Handler(w http.ResponseWriter, _ *http.Request) {
+	ipString, err := s.getLocalIPv4Address(s.options.NetIface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -625,8 +605,8 @@ func localIPv4Handler(w http.ResponseWriter, _ *http.Request, iface string) {
 	fmt.Fprintf(w, "%s", ipString)
 }
 
-func instanceIDHandler(w http.ResponseWriter, r *http.Request) {
-	val, err := formatV1Fields("%s", "instance_id")
+func (s *Server) instanceIDHandler(w http.ResponseWriter, r *http.Request) {
+	val, err := s.formatV1Fields("%s", "instance_id")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -634,8 +614,8 @@ func instanceIDHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", val)
 }
 
-func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
-	instType, err := getDSFieldValue("instance_type", "t2.micro")
+func (s *Server) instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
+	instType, err := s.getDSFieldValue("instance_type", "t2.micro")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -652,8 +632,8 @@ type iamInfoResponse struct {
 	InstanceProfileID  string `json:"InstanceProfileId"`
 }
 
-func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) iamInfoHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -697,8 +677,8 @@ func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", data)
 }
 
-func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -725,13 +705,13 @@ func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", roleName)
 }
 
-func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/latest/meta-data/iam/security-credentials/" {
-		iamSecurityCredentialsListHandler(w, r)
+		s.iamSecurityCredentialsListHandler(w, r)
 		return
 	}
 
-	fields, err := getDSMetadata()
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -759,11 +739,12 @@ func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if iamCredentials == nil {
+	iamCreds, imdsCreds := s.getIMDSCredentials()
+	if iamCreds == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	data, err := json.MarshalIndent(imdsCredentials, "", "  ")
+	data, err := json.MarshalIndent(imdsCreds, "", "  ")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -771,8 +752,8 @@ func iamSecurityCredentialsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", data)
 }
 
-func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
-	iff, err := net.InterfaceByName(iface)
+func (s *Server) macHandler(w http.ResponseWriter, r *http.Request) {
+	iff, err := s.networkInfo.InterfaceByName(s.options.NetIface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -780,8 +761,8 @@ func macHandler(w http.ResponseWriter, r *http.Request, iface string) {
 	fmt.Fprintf(w, "%s", iff.HardwareAddr.String())
 }
 
-func macsHandler(w http.ResponseWriter, r *http.Request) {
-	iff, err := net.Interfaces()
+func (s *Server) macsHandler(w http.ResponseWriter, r *http.Request) {
+	iff, err := s.networkInfo.Interfaces()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -805,8 +786,8 @@ func macsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
-	devices, err := getBlockDevices()
+func (s *Server) blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
+	devices, err := s.blockDevices.GetBlockDevices()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -822,23 +803,23 @@ func blockDeviceMappingListHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func blockDeviceMappingHandler(w http.ResponseWriter, r *http.Request) {
-	devices, err := getBlockDevices()
+func (s *Server) blockDeviceMappingHandler(w http.ResponseWriter, r *http.Request) {
+	devices, err := s.blockDevices.GetBlockDevices()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	device := path.Base(r.URL.Path)
-	path, ok := devices[device]
+	devPath, ok := devices[device]
 	if !ok {
 		http.Error(w, "No such device", http.StatusNotFound)
 		return
 	}
-	fmt.Fprintf(w, "%s", path)
+	fmt.Fprintf(w, "%s", devPath)
 }
 
-func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
-	az, err := getV1FieldValue("availability_zone", "")
+func (s *Server) placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
+	az, err := s.getV1FieldValue("availability_zone", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -846,8 +827,8 @@ func placementAvailabilityZoneHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", az)
 }
 
-func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -875,8 +856,8 @@ func servicesDomainHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", dom)
 }
 
-func getEndpoints() (map[string]string, error) {
-	fields, err := getDSMetadata()
+func (s *Server) getEndpoints() (map[string]string, error) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		return nil, err
 	}
@@ -902,8 +883,8 @@ func getEndpoints() (map[string]string, error) {
 	return result, nil
 }
 
-func servicesEndpointsHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) servicesEndpointsHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -963,18 +944,17 @@ type instanceIdentityDocument struct {
 	Region                  string    `json:"region"`
 }
 
-func instanceIdentityHandler(
+func (s *Server) instanceIdentityHandler(
 	w http.ResponseWriter,
 	r *http.Request,
-	options *Options,
 ) {
-	fields, err := getV1StandardMetadata()
+	fields, err := s.getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	dsfields, err := getDSMetadata()
+	dsfields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -998,7 +978,7 @@ func instanceIdentityHandler(
 		return
 	}
 
-	imageID, err := formatV1Fields("%s %s", "distro", "distro_release")
+	imageID, err := s.formatV1Fields("%s %s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1016,7 +996,7 @@ func instanceIdentityHandler(
 		return
 	}
 
-	ipString, err := getLocalIPv4Address(options.NetIface)
+	ipString, err := s.getLocalIPv4Address(s.options.NetIface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1031,9 +1011,9 @@ func instanceIdentityHandler(
 		InstanceID:              instID,
 		BillingProducts:         nil,
 		InstanceType:            instType,
-		AccountID:               options.AccountID,
+		AccountID:               s.options.AccountID,
 		ImageID:                 imageID,
-		PendingTime:             serverStartTime.Format(time.RFC3339),
+		PendingTime:             s.startTime.Format(time.RFC3339),
 		Architecture:            machine,
 		KernelID:                nil,
 		RamdiskID:               nil,
@@ -1049,8 +1029,8 @@ func instanceIdentityHandler(
 	w.Write(jsonData)
 }
 
-func tagsInstanceHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) tagsInstanceHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1099,8 +1079,8 @@ func tagsInstanceHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "%s", val.(string))
 }
 
-func autoscalingLifecycleStateHandler(w http.ResponseWriter, r *http.Request) {
-	fields, err := getDSMetadata()
+func (s *Server) autoscalingLifecycleStateHandler(w http.ResponseWriter, r *http.Request) {
+	fields, err := s.getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1124,31 +1104,4 @@ func autoscalingLifecycleStateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Fprintf(w, "%s", state)
-}
-
-func getBlockDevices() (map[string]string, error) {
-	disks := "/dev/disk/by-label"
-	dir, err := os.ReadDir(disks)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make(map[string]string)
-
-	for _, f := range dir {
-		name := f.Name()
-		if strings.Compare(name, "UEFI") == 0 ||
-			strings.Compare(name, "cidata") == 0 {
-			continue
-		}
-
-		node, err := filepath.EvalSymlinks(path.Join(disks, name))
-		if err != nil {
-			continue
-		}
-
-		result[name] = node
-	}
-
-	return result, nil
 }
