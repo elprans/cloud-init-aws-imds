@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,8 @@ import (
 const (
 	minRefreshInterval = 5 * time.Minute
 )
+
+var serverStartTime = time.Now().UTC()
 
 type IMDSCredentials struct {
 	AccessKeyId     string
@@ -327,6 +330,14 @@ func getCredRefreshInterval(config *aws.Config) time.Duration {
 func logRequest(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		klog.V(5).Infof("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
+		w.Header().Set("Server", "EC2ws")
+		w.Header().Set("Content-Type", "text/plain")
+		// Token endpoint has its own method check (PUT required).
+		// All other endpoints only accept GET.
+		if r.URL.Path != "/latest/api/token" && r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		handler.ServeHTTP(w, r)
 	})
 }
@@ -544,6 +555,23 @@ func getIAMCredentials() (*credentials.Credentials, *IMDSCredentials, string, er
 }
 
 func tokenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("X-Forwarded-For") != "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	ttl := r.Header.Get("X-aws-ec2-metadata-token-ttl-seconds")
+	if ttl == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if _, err := strconv.Atoi(ttl); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
 	token := base64.URLEncoding.EncodeToString([]byte("dummytoken"))
 	fmt.Fprintf(w, "%s", token)
 }
@@ -626,6 +654,15 @@ func instanceTypeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// iamInfoResponse matches the JSON structure returned by real AWS IMDS at
+// /latest/meta-data/iam/info.
+type iamInfoResponse struct {
+	Code               string `json:"Code"`
+	LastUpdated        string `json:"LastUpdated"`
+	InstanceProfileArn string `json:"InstanceProfileArn"`
+	InstanceProfileId  string `json:"InstanceProfileId"`
+}
+
 func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
 	fields, err := getDSMetadata()
 	if err != nil {
@@ -651,14 +688,24 @@ func iamInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if len(profile) == 0 {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	} else {
-		data, err := json.MarshalIndent(profile, "", "  ")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		} else {
-			fmt.Fprintf(w, "%s", data)
-		}
 	}
+
+	arn, _ := getScalarFieldValue(profile, "arn", "")
+	id, _ := getScalarFieldValue(profile, "id", "")
+
+	info := iamInfoResponse{
+		Code:               "Success",
+		LastUpdated:        time.Now().UTC().Format(time.RFC3339),
+		InstanceProfileArn: arn,
+		InstanceProfileId:  id,
+	}
+
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "%s", data)
 }
 
 func iamSecurityCredentialsListHandler(w http.ResponseWriter, r *http.Request) {
@@ -753,11 +800,21 @@ func macsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i, iface := range iff {
-		if i > 0 {
+	first := true
+	for _, iface := range iff {
+		// Skip loopback (empty MAC) and virtual interfaces.
+		if len(iface.HardwareAddr) == 0 {
+			continue
+		}
+		if strings.HasPrefix(iface.Name, "docker") ||
+			strings.HasPrefix(iface.Name, "veth") {
+			continue
+		}
+		if !first {
 			fmt.Fprintf(w, "\n")
 		}
 		fmt.Fprintf(w, "%s/", iface.HardwareAddr.String())
+		first = false
 	}
 }
 
@@ -899,6 +956,27 @@ func servicesEndpointsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// instanceIdentityDocument matches the JSON structure returned by real AWS IMDS.
+// Field order is deterministic because encoding/json marshals struct fields in
+// declaration order.
+type instanceIdentityDocument struct {
+	DevpayProductCodes      *[]string `json:"devpayProductCodes"`
+	MarketplaceProductCodes *[]string `json:"marketplaceProductCodes"`
+	AvailabilityZone        string    `json:"availabilityZone"`
+	PrivateIP               string    `json:"privateIp"`
+	Version                 string    `json:"version"`
+	InstanceID              string    `json:"instanceId"`
+	BillingProducts         *[]string `json:"billingProducts"`
+	InstanceType            string    `json:"instanceType"`
+	AccountID               string    `json:"accountId"`
+	ImageID                 string    `json:"imageId"`
+	PendingTime             string    `json:"pendingTime"`
+	Architecture            string    `json:"architecture"`
+	KernelID                *string   `json:"kernelId"`
+	RamdiskID               *string   `json:"ramdiskId"`
+	Region                  string    `json:"region"`
+}
+
 func instanceIdentityHandler(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -907,68 +985,79 @@ func instanceIdentityHandler(
 	fields, err := getV1StandardMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	dsfields, err := getDSMetadata()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	az, err := getScalarFieldValue(fields, "availability_zone", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	instId, err := getScalarFieldValue(fields, "instance_id", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	instType, err := getScalarFieldValue(dsfields, "instance_type", "t2.micro")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	imageId, err := formatV1Fields("%s %s", "distro", "distro_release")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	machine, err := getScalarFieldValue(fields, "machine", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	region, err := getScalarFieldValue(fields, "region", "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	ipString, err := getLocalIPv4Address(options.NetIface)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	result := make(map[string]interface{})
-	result["devpayProductCodes"] = make([]string, 0)
-	result["marketplaceProductCodes"] = make([]string, 0)
-	result["availabilityZone"] = az
-	result["privateIp"] = ipString
-	result["version"] = "2017-09-30"
-	result["instanceId"] = instId
-	result["instanceType"] = instType
-	result["billingProducts"] = nil
-	result["accountId"] = "invalid"
-	result["imageId"] = imageId
-	result["pendingTime"] = nil
-	result["architecture"] = machine
-	result["kernelId"] = nil
-	result["ramdiskId"] = nil
-	result["region"] = region
+	doc := instanceIdentityDocument{
+		DevpayProductCodes:      nil,
+		MarketplaceProductCodes: nil,
+		AvailabilityZone:        az,
+		PrivateIP:               ipString,
+		Version:                 "2017-09-30",
+		InstanceID:              instId,
+		BillingProducts:         nil,
+		InstanceType:            instType,
+		AccountID:               options.AccountID,
+		ImageID:                 imageId,
+		PendingTime:             serverStartTime.Format(time.RFC3339),
+		Architecture:            machine,
+		KernelID:                nil,
+		RamdiskID:               nil,
+		Region:                  region,
+	}
 
-	jsonData, err := json.Marshal(result)
+	jsonData, err := json.Marshal(doc)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Write(jsonData)

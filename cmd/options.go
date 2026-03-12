@@ -28,17 +28,19 @@ import (
 
 // Options is the combined set of options for all operating modes.
 type Options struct {
-	BindTo   string
-	Port     string
-	NetIface string
+	BindTo    string
+	Port      string
+	NetIface  string
+	AccountID string
 }
 
 func GetOptions(fs *flag.FlagSet) *Options {
 	var (
-		version = fs.Bool("version", false, "Print the version and exit.")
-		bindTo  = fs.String("bind-to", "169.254.169.254", "Address to bind to.")
-		port    = fs.String("port", "80", "Port to bind to.")
-		iface   = fs.String("net-iface", "", "Network interface used for traffic.")
+		version   = fs.Bool("version", false, "Print the version and exit.")
+		bindTo    = fs.String("bind-to", "169.254.169.254", "Address to bind to.")
+		port      = fs.String("port", "80", "Port to bind to.")
+		iface     = fs.String("net-iface", "", "Network interface used for traffic.")
+		accountID = fs.String("account-id", "123456789012", "AWS account ID to return in instance identity document.")
 
 		args = os.Args[1:]
 	)
@@ -70,8 +72,9 @@ func GetOptions(fs *flag.FlagSet) *Options {
 	}
 
 	return &Options{
-		BindTo:   *bindTo,
-		Port:     *port,
-		NetIface: *iface,
+		BindTo:    *bindTo,
+		Port:      *port,
+		NetIface:  *iface,
+		AccountID: *accountID,
 	}
 }
